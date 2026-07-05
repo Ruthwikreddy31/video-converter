@@ -1,0 +1,30 @@
+version: '3.9'
+
+services:
+  backend:
+    build: ./backend
+    container_name: imax-converter-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - video_uploads:/app/uploads
+      - video_outputs:/app/outputs
+      - video_previews:/app/previews
+    environment:
+      - DATABASE_URL=sqlite:///./video_converter.db
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: imax-converter-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  video_uploads:
+  video_outputs:
+  video_previews:

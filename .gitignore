@@ -1,0 +1,44 @@
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Databases
+*.db
+*.db-journal
+*.sqlite
+
+# Application media/uploads
+uploads/*
+outputs/*
+previews/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+!previews/.gitkeep
+
+backend/uploads/*
+backend/outputs/*
+backend/previews/*
+!backend/uploads/.gitkeep
+!backend/outputs/.gitkeep
+!backend/previews/.gitkeep
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
