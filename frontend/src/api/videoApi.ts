@@ -43,6 +43,7 @@ export interface DownloadProgress {
   video_id?: string
   info?: VideoInfo
   thumbnail_url?: string
+  video_url?: string
 }
 
 export interface ConversionResponse {
