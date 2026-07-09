@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { Play, Pause, Volume2, VolumeX, Maximize2, Loader2, Film, Monitor, Tv, Eye, Layers } from 'lucide-react'
 import clsx from 'clsx'
 
+import { ensureAbsoluteUrl } from '../api/videoApi'
+
 interface Props {
   videoId: string
   videoUrl?: string
@@ -179,7 +181,7 @@ export default function PreviewGrid({ videoId, videoUrl }: Props) {
     return `${minutes}:${seconds.toString().padStart(2, '0')}`
   }
 
-  const streamUrl = videoUrl ? videoUrl : `/uploads/${videoId}.mp4`
+  const streamUrl = ensureAbsoluteUrl(videoUrl ? videoUrl : `/uploads/${videoId}.mp4`)
 
   return (
     <div className="bg-cinema-black/40 border border-cinema-border rounded-2xl p-6 space-y-6">

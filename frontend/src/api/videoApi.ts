@@ -1,4 +1,18 @@
-const BASE_URL = '/api'
+const getApiUrl = () => {
+  const url = import.meta.env.VITE_API_URL
+  if (!url) return ''
+  return url.endsWith('/') ? url.slice(0, -1) : url
+}
+
+export const API_TARGET = getApiUrl()
+const BASE_URL = API_TARGET ? `${API_TARGET}/api` : '/api'
+
+export const ensureAbsoluteUrl = (url: string | null | undefined): string => {
+  if (!url) return ''
+  if (url.startsWith('http://') || url.startsWith('https://')) return url
+  return `${API_TARGET}${url}`
+}
+
 
 export interface VideoInfo {
   width: number
@@ -107,7 +121,10 @@ export const videoApi = {
 
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(JSON.parse(xhr.responseText))
+          const data = JSON.parse(xhr.responseText)
+          if (data.thumbnail_url) data.thumbnail_url = ensureAbsoluteUrl(data.thumbnail_url)
+          if (data.video_url) data.video_url = ensureAbsoluteUrl(data.video_url)
+          resolve(data)
         } else {
           const err = JSON.parse(xhr.responseText)
           reject(new Error(err.detail || 'Upload failed'))
@@ -122,7 +139,15 @@ export const videoApi = {
   async getVideoInfo(videoId: string): Promise<VideoDetails> {
     const res = await fetch(`${BASE_URL}/upload/${videoId}/info`)
     if (!res.ok) throw new Error('Failed to get video info')
-    return res.json()
+    const data = await res.json()
+    if (data.thumbnail_url) data.thumbnail_url = ensureAbsoluteUrl(data.thumbnail_url)
+    if (data.video_url) data.video_url = ensureAbsoluteUrl(data.video_url)
+    if (data.previews) {
+      for (const key in data.previews) {
+        data.previews[key] = ensureAbsoluteUrl(data.previews[key])
+      }
+    }
+    return data
   },
 
   async getYoutubeInfo(url: string) {
@@ -154,7 +179,10 @@ export const videoApi = {
   async getDownloadProgress(videoId: string): Promise<DownloadProgress> {
     const res = await fetch(`${BASE_URL}/youtube/progress/${videoId}`)
     if (!res.ok) throw new Error('Progress not found')
-    return res.json()
+    const data = await res.json()
+    if (data.thumbnail_url) data.thumbnail_url = ensureAbsoluteUrl(data.thumbnail_url)
+    if (data.video_url) data.video_url = ensureAbsoluteUrl(data.video_url)
+    return data
   },
 
   async startConversion(
@@ -181,13 +209,20 @@ export const videoApi = {
   async getConversionProgress(conversionId: string): Promise<ConversionProgress> {
     const res = await fetch(`${BASE_URL}/convert/progress/${conversionId}`)
     if (!res.ok) throw new Error('Conversion not found')
-    return res.json()
+    const data = await res.json()
+    if (data.output_url) data.output_url = ensureAbsoluteUrl(data.output_url)
+    return data
   },
 
   async getHistory(): Promise<ConversionHistoryItem[]> {
     const res = await fetch(`${BASE_URL}/convert/history`)
     if (!res.ok) throw new Error('Failed to get history')
-    return res.json()
+    const data = await res.json()
+    return data.map((item: any) => ({
+      ...item,
+      output_url: ensureAbsoluteUrl(item.output_url),
+      thumbnail_url: ensureAbsoluteUrl(item.thumbnail_url),
+    }))
   },
 
   async getStats(): Promise<Stats> {
