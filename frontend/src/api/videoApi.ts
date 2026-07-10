@@ -1,18 +1,10 @@
-const getApiUrl = () => {
-  const url = import.meta.env.VITE_API_URL
-  if (!url) return ''
-  return url.endsWith('/') ? url.slice(0, -1) : url
-}
-
-export const API_TARGET = getApiUrl()
-const BASE_URL = API_TARGET ? `${API_TARGET}/api` : '/api'
+const BASE_URL = 'https://video-converter-1-hjva.onrender.com'
 
 export const ensureAbsoluteUrl = (url: string | null | undefined): string => {
   if (!url) return ''
   if (url.startsWith('http://') || url.startsWith('https://')) return url
-  return `${API_TARGET}${url}`
+  return `${BASE_URL}${url}`
 }
-
 
 export interface VideoInfo {
   width: number
@@ -101,7 +93,6 @@ export interface Stats {
 }
 
 export const videoApi = {
-  // Upload local file with progress
   async uploadVideo(
     file: File,
     onProgress?: (pct: number) => void
@@ -111,7 +102,7 @@ export const videoApi = {
 
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
-      xhr.open('POST', `${BASE_URL}/upload/`)
+      xhr.open('POST', `${BASE_URL}/api/upload/`)
 
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && onProgress) {
@@ -126,8 +117,12 @@ export const videoApi = {
           if (data.video_url) data.video_url = ensureAbsoluteUrl(data.video_url)
           resolve(data)
         } else {
-          const err = JSON.parse(xhr.responseText)
-          reject(new Error(err.detail || 'Upload failed'))
+          try {
+            const err = JSON.parse(xhr.responseText)
+            reject(new Error(err.detail || 'Upload failed'))
+          } catch {
+            reject(new Error('Upload failed'))
+          }
         }
       }
 
@@ -137,7 +132,7 @@ export const videoApi = {
   },
 
   async getVideoInfo(videoId: string): Promise<VideoDetails> {
-    const res = await fetch(`${BASE_URL}/upload/${videoId}/info`)
+    const res = await fetch(`${BASE_URL}/api/upload/${videoId}/info`)
     if (!res.ok) throw new Error('Failed to get video info')
     const data = await res.json()
     if (data.thumbnail_url) data.thumbnail_url = ensureAbsoluteUrl(data.thumbnail_url)
@@ -151,7 +146,7 @@ export const videoApi = {
   },
 
   async getYoutubeInfo(url: string) {
-    const res = await fetch(`${BASE_URL}/youtube/info`, {
+    const res = await fetch(`${BASE_URL}/api/youtube/info`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
@@ -164,7 +159,7 @@ export const videoApi = {
   },
 
   async startYoutubeDownload(url: string): Promise<YoutubeDownloadResponse> {
-    const res = await fetch(`${BASE_URL}/youtube/download`, {
+    const res = await fetch(`${BASE_URL}/api/youtube/download`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
@@ -177,7 +172,7 @@ export const videoApi = {
   },
 
   async getDownloadProgress(videoId: string): Promise<DownloadProgress> {
-    const res = await fetch(`${BASE_URL}/youtube/progress/${videoId}`)
+    const res = await fetch(`${BASE_URL}/api/youtube/progress/${videoId}`)
     if (!res.ok) throw new Error('Progress not found')
     const data = await res.json()
     if (data.thumbnail_url) data.thumbnail_url = ensureAbsoluteUrl(data.thumbnail_url)
@@ -190,7 +185,7 @@ export const videoApi = {
     targetFormat: string,
     cropMethod: string = 'smart'
   ): Promise<ConversionResponse> {
-    const res = await fetch(`${BASE_URL}/convert/start`, {
+    const res = await fetch(`${BASE_URL}/api/convert/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -207,7 +202,7 @@ export const videoApi = {
   },
 
   async getConversionProgress(conversionId: string): Promise<ConversionProgress> {
-    const res = await fetch(`${BASE_URL}/convert/progress/${conversionId}`)
+    const res = await fetch(`${BASE_URL}/api/convert/progress/${conversionId}`)
     if (!res.ok) throw new Error('Conversion not found')
     const data = await res.json()
     if (data.output_url) data.output_url = ensureAbsoluteUrl(data.output_url)
@@ -215,7 +210,7 @@ export const videoApi = {
   },
 
   async getHistory(): Promise<ConversionHistoryItem[]> {
-    const res = await fetch(`${BASE_URL}/convert/history`)
+    const res = await fetch(`${BASE_URL}/api/convert/history`)
     if (!res.ok) throw new Error('Failed to get history')
     const data = await res.json()
     return data.map((item: any) => ({
@@ -226,7 +221,7 @@ export const videoApi = {
   },
 
   async getStats(): Promise<Stats> {
-    const res = await fetch(`${BASE_URL}/status/stats`)
+    const res = await fetch(`${BASE_URL}/api/status/stats`)
     if (!res.ok) throw new Error('Failed to get stats')
     return res.json()
   },
