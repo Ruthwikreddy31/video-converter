@@ -8,30 +8,15 @@ from app.services.config import YTDLP_BIN, FFMPEG_BIN, SUBPROCESS_FLAGS
 
 MAX_DOWNLOAD_HEIGHT = int(os.getenv("MAX_DOWNLOAD_HEIGHT", "720") or "720")
 
-# ── Cookies file resolution ────────────────────────────────────────────────────
-# Checks multiple locations in priority order so it works on:
-#   - Render (Secret Files go to /etc/secrets/)
-#   - Local dev (backend/cookies/cookies.txt)
-#   - Docker (/app/cookies/cookies.txt)
-#   - Any custom path via YOUTUBE_COOKIES_FILE env var
 
 def _resolve_cookies_file() -> str:
-    # 1. Explicit env var (highest priority)
     from_env = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
     if from_env and os.path.isfile(from_env):
-        print(f"[youtube] Using cookies from env var: {from_env}")
+        print(f"[youtube] Using cookies: {from_env}")
         return from_env
-    if from_env:
-        print(f"[youtube] WARNING: YOUTUBE_COOKIES_FILE set to '{from_env}' but file not found there")
 
-    # 2. Render Secret Files location (Render always puts secrets here)
-    render_path = "/etc/secrets/cookies.txt"
-    if os.path.isfile(render_path):
-        print(f"[youtube] Found cookies at Render secret path: {render_path}")
-        return render_path
-
-    # 3. Local dev / Docker locations
     candidates = [
+        "/etc/secrets/cookies.txt",
         os.path.join(os.path.dirname(__file__), "..", "..", "cookies", "cookies.txt"),
         os.path.join(os.getcwd(), "cookies", "cookies.txt"),
         "/app/cookies/cookies.txt",
@@ -42,8 +27,9 @@ def _resolve_cookies_file() -> str:
             print(f"[youtube] Found cookies at: {abs_c}")
             return abs_c
 
-    print("[youtube] WARNING: No cookies.txt found in any location. YouTube may block downloads.")
+    print("[youtube] WARNING: No cookies.txt found.")
     return ""
+
 
 COOKIES_FILE = _resolve_cookies_file()
 
@@ -69,12 +55,34 @@ def _clean_url(url: str) -> str:
 
 
 def _cookies_args() -> list:
-    """Return --cookies arg if a valid cookies file is found."""
-    # Re-resolve every call in case file appeared after startup
     cookies = COOKIES_FILE or _resolve_cookies_file()
     if cookies and os.path.isfile(cookies):
         return ["--cookies", cookies]
     return []
+
+
+def _base_ytdlp_args() -> list:
+    """
+    Core yt-dlp arguments that bypass YouTube's bot detection and 403 errors.
+
+    HTTP 403 Forbidden on video data happens when:
+    1. YouTube ties the session cookie to the original browser's IP
+    2. The download comes from a different IP (Render server)
+    3. YouTube detects the mismatch and blocks the stream
+
+    Fix: use the Android or iOS client instead of the web client.
+    These clients use different authentication that isn't IP-tied.
+    --extractor-args "youtube:player_client=android"
+    tells yt-dlp to fetch the video using YouTube's Android API,
+    which is far less strictly validated against IP.
+    """
+    return [
+        "--extractor-args", "youtube:player_client=android,web",
+        "--no-check-certificate",
+        "--socket-timeout", "30",
+        "--retries", "3",
+        "--fragment-retries", "3",
+    ]
 
 
 def get_video_info(url: str) -> Dict[str, Any]:
@@ -84,6 +92,7 @@ def get_video_info(url: str) -> Dict[str, Any]:
         "--dump-json",
         "--no-playlist",
         "--no-warnings",
+        *_base_ytdlp_args(),
         *_cookies_args(),
         clean_url
     ]
@@ -109,23 +118,25 @@ def _friendly_yt_error(raw_output: str) -> str:
         return "This video is age-restricted."
     if "unavailable" in err or "not available" in err:
         return "This video is unavailable (deleted, region-blocked, or removed)."
-    if "sign in to confirm" in err or "not a bot" in err or "bot" in err:
+    if "sign in to confirm" in err or "not a bot" in err:
+        return "YouTube bot check failed. Refresh your cookies.txt on Render."
+    if "http error 403" in err or "forbidden" in err:
         return (
-            "YouTube is blocking this server's IP (bot check). "
-            "Go to Render Dashboard → Environment → Secret Files → "
-            "add filename '/etc/secrets/cookies.txt' with your YouTube cookies content. "
-            "Then add env var YOUTUBE_COOKIES_FILE=/etc/secrets/cookies.txt"
+            "YouTube returned 403 Forbidden on the video stream. "
+            "This usually means your cookies have expired or are IP-restricted. "
+            "Please re-export fresh cookies from your browser while logged into YouTube "
+            "and update them in Render → Environment → Secret Files → cookies.txt"
         )
-    if "unable to extract" in err or "failed to extract" in err:
-        return "yt-dlp needs updating. Contact admin."
-    if "certificate" in err or "ssl" in err:
-        return "SSL error reaching YouTube."
     if "http error 429" in err or "too many requests" in err:
-        return "YouTube rate-limiting this server. Wait a few minutes."
+        return "YouTube is rate-limiting this server. Wait a few minutes and try again."
+    if "unable to extract" in err or "failed to extract" in err:
+        return "yt-dlp needs updating. Contact admin to run: pip install -U yt-dlp"
     if "no video formats found" in err or "requested format is not available" in err:
         return "No downloadable format found for this video."
     if "no space left" in err or "disk" in err:
         return "Server ran out of disk space. Try again later."
+    if "certificate" in err or "ssl" in err:
+        return "SSL error reaching YouTube."
     cleaned = raw_output.strip().replace("\n", " ")[:500] if raw_output else "Unknown error"
     return f"yt-dlp error: {cleaned}"
 
@@ -159,8 +170,7 @@ def download_video(
         print(f"[youtube] Available disk: {free_mb:.0f} MB")
         if free_mb < 150:
             raise RuntimeError(
-                f"Only {free_mb:.0f}MB disk space left on server. "
-                "Render free tier has limited storage — try again later."
+                f"Only {free_mb:.0f}MB disk space left. Try again later."
             )
     except RuntimeError:
         raise
@@ -174,11 +184,6 @@ def download_video(
     format_selector = _build_format_selector()
     cookies = _cookies_args()
 
-    if cookies:
-        print(f"[youtube] Using cookies: {cookies[1]}")
-    else:
-        print("[youtube] No cookies — YouTube may block this download")
-
     cmd = [
         YTDLP_BIN,
         "--no-playlist",
@@ -189,9 +194,7 @@ def download_video(
         "-o", output_template,
         "--newline",
         "--progress",
-        "--no-check-certificate",
-        "--socket-timeout", "30",
-        "--retries", "3",
+        *_base_ytdlp_args(),   # android client + retry flags
         *cookies,
         clean_url,
     ]
@@ -211,20 +214,24 @@ def download_video(
         if not line:
             continue
         full_output_lines.append(line)
+
         if "[download]" in line and "%" in line:
             m = re.search(r"(\d+\.?\d*)%", line)
             if m and progress_callback:
                 progress_callback(int(float(m.group(1))), f"Downloading... {m.group(1)}%")
+
         if "Destination:" in line:
             m = re.search(r"Destination:\s*(.+)", line)
             if m:
                 c = m.group(1).strip()
                 if c.lower().endswith(".mp4"):
                     tracked_file = c
+
         if "[Merger]" in line:
             m = re.search(r'Merging formats into "(.+?)"', line)
             if m:
                 tracked_file = m.group(1).strip()
+
         if "[download] 100%" in line and progress_callback:
             progress_callback(100, "Processing...")
 
