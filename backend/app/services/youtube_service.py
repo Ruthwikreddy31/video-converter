@@ -107,7 +107,18 @@ def _friendly_yt_error(raw_output: str) -> str:
     if "ffmpeg" in err and ("not found" in err or "is not installed" in err):
         return "yt-dlp could not find FFmpeg. Check FFMPEG_PATH in backend/.env."
 
-    cleaned = raw_output.strip().replace("\n", " ")[:400] if raw_output else "Unknown error"
+    # Look for specific lines containing "ERROR:" or "error:"
+    for line in (raw_output or "").splitlines():
+        if "error:" in line.lower():
+            return f"yt-dlp error: {line.strip()}"
+
+    # Fall back to the end of the raw output if no explicit error line is found
+    if raw_output:
+        lines = raw_output.strip().splitlines()
+        last_few = " ".join(lines[-3:]) if len(lines) >= 3 else raw_output.strip()
+        cleaned = last_few.replace("\n", " ")[:400]
+    else:
+        cleaned = "Unknown error"
     return f"yt-dlp error: {cleaned}"
 
 
