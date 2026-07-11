@@ -2,19 +2,40 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import uuid
 import os
+import glob
+import time
 
 from app.services.youtube_service import validate_youtube_url, get_video_info, download_video
 from app.services.ffmpeg_service import extract_video_info, generate_thumbnail
 from app.services.preview_service import generate_all_previews
 
 router = APIRouter()
-
-# In-memory progress store
 download_progress: dict = {}
 
 
 class YouTubeRequest(BaseModel):
     url: str
+
+
+def _cleanup_old_files(max_age_hours: int = 2):
+    """
+    Delete uploads/outputs/previews older than max_age_hours.
+    Keeps Render's free-tier disk from filling up after a few downloads.
+    """
+    try:
+        cutoff = time.time() - (max_age_hours * 3600)
+        for folder in ["uploads", "outputs", "previews"]:
+            if not os.path.isdir(folder):
+                continue
+            for fpath in glob.glob(os.path.join(folder, "*")):
+                try:
+                    if os.path.getmtime(fpath) < cutoff:
+                        os.remove(fpath)
+                        print(f"[cleanup] Deleted old file: {fpath}")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[cleanup] Error during cleanup: {e}")
 
 
 @router.post("/info")
@@ -33,6 +54,9 @@ async def yt_info(request: YouTubeRequest):
 async def yt_download(request: YouTubeRequest, background_tasks: BackgroundTasks):
     if not validate_youtube_url(request.url):
         raise HTTPException(400, "Invalid YouTube URL.")
+
+    # Clean up old files before starting a new download
+    _cleanup_old_files(max_age_hours=2)
 
     video_id = str(uuid.uuid4())
     download_progress[video_id] = {
@@ -55,16 +79,16 @@ def _download_and_process(url: str, video_id: str):
             }
 
         download_progress[video_id] = {
-            "status": "downloading", "progress": 0, "message": "Starting yt-dlp..."
+            "status": "downloading", "progress": 0, "message": "Starting download..."
         }
 
         file_path = download_video(url, "uploads", video_id, cb)
-
         abs_file = os.path.abspath(file_path)
+
         if not os.path.isfile(abs_file):
             raise RuntimeError(
                 f"Downloaded file not found at: {abs_file}. "
-                "Check FFMPEG_PATH in backend/.env — yt-dlp needs ffmpeg to merge video+audio."
+                "Check FFMPEG_PATH — yt-dlp needs ffmpeg to merge video+audio."
             )
 
         # ── 2. Analyze ────────────────────────────────────────────────────────
@@ -122,7 +146,6 @@ def _download_and_process(url: str, video_id: str):
             "video_id": video_id,
             "info": info,
             "thumbnail_url": f"/previews/{video_id}_thumb.jpg",
-            "video_url": f"/uploads/{video_id}.mp4",
         }
 
     except Exception as e:

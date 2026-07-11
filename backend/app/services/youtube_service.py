@@ -2,19 +2,14 @@ import subprocess
 import json
 import os
 import re
-import sys
 from typing import Optional, Dict, Any, Callable
 
 from app.services.config import YTDLP_BIN, FFMPEG_BIN, SUBPROCESS_FLAGS
 
-MAX_DOWNLOAD_HEIGHT = int(os.getenv("MAX_DOWNLOAD_HEIGHT", "1080") or "1080")
+MAX_DOWNLOAD_HEIGHT = int(os.getenv("MAX_DOWNLOAD_HEIGHT", "720") or "720")
 
-# Path to YouTube cookies file — fixes "Sign in to confirm you're not a bot"
-# errors on cloud servers (Render, Railway, etc.) whose IPs are flagged.
-# Set YOUTUBE_COOKIES_FILE=/app/cookies/cookies.txt in your Render env vars.
+# Cookies file path — fixes YouTube bot-check on cloud servers
 COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
-
-# Fallback: auto-detect cookies.txt in common locations relative to this file
 if not COOKIES_FILE:
     _candidates = [
         os.path.join(os.path.dirname(__file__), "..", "..", "cookies", "cookies.txt"),
@@ -38,7 +33,6 @@ def validate_youtube_url(url: str) -> bool:
 
 
 def _clean_url(url: str) -> str:
-    """Strip tracking params (?si=...) that can cause yt-dlp extraction quirks."""
     url = url.strip()
     m = re.match(r"^(https?://youtu\.be/[\w-]+)", url)
     if m: return m.group(1)
@@ -50,7 +44,6 @@ def _clean_url(url: str) -> str:
 
 
 def _cookies_args() -> list:
-    """Return yt-dlp cookie arguments if a cookies file is available."""
     if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
         return ["--cookies", COOKIES_FILE]
     return []
@@ -66,7 +59,8 @@ def get_video_info(url: str) -> Dict[str, Any]:
         *_cookies_args(),
         clean_url
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **SUBPROCESS_FLAGS)
+    # Increased from 30s to 120s for slow cloud servers
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, **SUBPROCESS_FLAGS)
     if result.returncode != 0:
         raise ValueError(_friendly_yt_error(result.stderr or result.stdout))
     data = json.loads(result.stdout)
@@ -81,48 +75,43 @@ def get_video_info(url: str) -> Dict[str, Any]:
 
 
 def _friendly_yt_error(raw_output: str) -> str:
-    """Translate common yt-dlp error patterns into clear, specific messages."""
     err = (raw_output or "").lower()
-
     if "private" in err:
         return "This video is private and cannot be downloaded."
     if "age" in err and "restrict" in err:
-        return "This video is age-restricted and cannot be downloaded without sign-in."
+        return "This video is age-restricted."
     if "unavailable" in err or "not available" in err:
-        return "This video is unavailable (may be deleted, region-blocked, or removed)."
+        return "This video is unavailable (deleted, region-blocked, or removed)."
     if "sign in to confirm" in err or "not a bot" in err or "bot" in err:
         return (
             "YouTube is blocking this server's IP (bot check). "
-            "Fix: Upload your cookies.txt file to backend/cookies/cookies.txt "
-            "and set YOUTUBE_COOKIES_FILE=/app/cookies/cookies.txt in Render environment variables."
+            "Upload cookies.txt to backend/cookies/ and set "
+            "YOUTUBE_COOKIES_FILE=/app/cookies/cookies.txt in Render env vars."
         )
     if "unable to extract" in err or "failed to extract" in err:
-        return "YouTube changed something yt-dlp doesn't recognize yet. Run: pip install -U yt-dlp"
+        return "yt-dlp needs updating. Run: pip install -U yt-dlp"
     if "certificate" in err or "ssl" in err:
         return "SSL/certificate error reaching YouTube."
     if "http error 429" in err or "too many requests" in err:
         return "YouTube is rate-limiting this server. Wait a few minutes and try again."
     if "no video formats found" in err or "requested format is not available" in err:
-        return "No downloadable format found for this video."
+        return "No downloadable format found."
     if "ffmpeg" in err and ("not found" in err or "is not installed" in err):
-        return "yt-dlp could not find FFmpeg. Check FFMPEG_PATH in backend/.env."
-
-    # Look for specific lines containing "ERROR:" or "error:"
-    for line in (raw_output or "").splitlines():
-        if "error:" in line.lower():
-            return f"yt-dlp error: {line.strip()}"
-
-    # Fall back to the end of the raw output if no explicit error line is found
-    if raw_output:
-        lines = raw_output.strip().splitlines()
-        last_few = " ".join(lines[-3:]) if len(lines) >= 3 else raw_output.strip()
-        cleaned = last_few.replace("\n", " ")[:400]
-    else:
-        cleaned = "Unknown error"
+        return "FFmpeg not found. Check FFMPEG_PATH in backend/.env."
+    if "no space left" in err or "disk" in err:
+        return "Server ran out of disk space. Render free tier has very limited storage."
+    cleaned = raw_output.strip().replace("\n", " ")[:500] if raw_output else "Unknown error"
     return f"yt-dlp error: {cleaned}"
 
 
 def _build_format_selector() -> str:
+    """
+    On Render free tier:
+    - Disk is limited (~500MB usable)
+    - Download at 720p max to keep file sizes under ~200MB
+    - Prefer mp4 to avoid remuxing overhead
+    - Fall back broadly so something always downloads
+    """
     if MAX_DOWNLOAD_HEIGHT and MAX_DOWNLOAD_HEIGHT > 0:
         h = MAX_DOWNLOAD_HEIGHT
         return (
@@ -144,17 +133,33 @@ def download_video(
     abs_dir = os.path.abspath(output_dir)
     os.makedirs(abs_dir, exist_ok=True)
 
+    # Check available disk space before downloading (Render free = ~512MB)
+    try:
+        import shutil
+        free_bytes = shutil.disk_usage(abs_dir).free
+        free_mb = free_bytes / (1024 * 1024)
+        print(f"[youtube] Available disk space: {free_mb:.0f} MB")
+        if free_mb < 150:
+            raise RuntimeError(
+                f"Only {free_mb:.0f}MB disk space remaining on server. "
+                "Free tier storage is limited — try again later or upgrade your Render plan."
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+
     clean_url = _clean_url(url)
     output_template = os.path.join(abs_dir, f"{video_id}.%(ext)s")
     final_mp4 = os.path.join(abs_dir, f"{video_id}.mp4")
     ffmpeg_dir = os.path.dirname(os.path.abspath(FFMPEG_BIN))
     format_selector = _build_format_selector()
-
     cookies = _cookies_args()
+
     if cookies:
-        print(f"[youtube] Using cookies file: {COOKIES_FILE}")
+        print(f"[youtube] Using cookies: {COOKIES_FILE}")
     else:
-        print("[youtube] WARNING: No cookies file found. YouTube may block this download.")
+        print("[youtube] WARNING: No cookies file — YouTube may block this download.")
 
     cmd = [
         YTDLP_BIN,
@@ -167,7 +172,10 @@ def download_video(
         "--newline",
         "--progress",
         "--no-check-certificate",
-        *cookies,          # --cookies cookies.txt if available
+        # Limit download speed reporting overhead on slow servers
+        "--socket-timeout", "30",
+        "--retries", "3",
+        *cookies,
         clean_url,
     ]
 
@@ -229,6 +237,6 @@ def download_video(
 
     tail = "\n".join(full_output_lines[-15:]) if full_output_lines else "(no output)"
     raise RuntimeError(
-        f"yt-dlp reported success but no output file found in {abs_dir}.\n"
-        f"Last yt-dlp output:\n{tail}"
+        f"yt-dlp reported success but no output file found.\n"
+        f"Last output:\n{tail}"
     )
