@@ -7,16 +7,25 @@ from typing import Optional, Dict, Any, Callable
 
 from app.services.config import YTDLP_BIN, FFMPEG_BIN, SUBPROCESS_FLAGS
 
-# Cap download resolution by default. Many trailers/promo videos are
-# uploaded in 4K (or higher) masters — without a cap, yt-dlp's "best"
-# selector grabs the absolute highest quality available, which for a 4K
-# trailer can be several GB and take 30-60+ minutes even on a decent
-# connection. Capping to 1080p (still excellent quality, more than enough
-# for any of the cinema aspect-ratio crops this app produces) keeps
-# downloads in a reasonable multi-minute range. Override via .env:
-#   MAX_DOWNLOAD_HEIGHT=2160   (allow up to 4K)
-#   MAX_DOWNLOAD_HEIGHT=0      (no cap — original "best" behavior)
 MAX_DOWNLOAD_HEIGHT = int(os.getenv("MAX_DOWNLOAD_HEIGHT", "1080") or "1080")
+
+# Path to YouTube cookies file — fixes "Sign in to confirm you're not a bot"
+# errors on cloud servers (Render, Railway, etc.) whose IPs are flagged.
+# Set YOUTUBE_COOKIES_FILE=/app/cookies/cookies.txt in your Render env vars.
+COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
+
+# Fallback: auto-detect cookies.txt in common locations relative to this file
+if not COOKIES_FILE:
+    _candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "..", "cookies", "cookies.txt"),
+        os.path.join(os.getcwd(), "cookies", "cookies.txt"),
+        "/app/cookies/cookies.txt",
+    ]
+    for _c in _candidates:
+        if os.path.isfile(_c):
+            COOKIES_FILE = os.path.abspath(_c)
+            print(f"[youtube] Auto-detected cookies file: {COOKIES_FILE}")
+            break
 
 
 def validate_youtube_url(url: str) -> bool:
@@ -29,30 +38,34 @@ def validate_youtube_url(url: str) -> bool:
 
 
 def _clean_url(url: str) -> str:
-    """
-    Strip tracking params (?si=...) that are sometimes mangled by clients
-    and can occasionally cause yt-dlp extraction quirks. Keep only the
-    core video id parameter.
-    """
+    """Strip tracking params (?si=...) that can cause yt-dlp extraction quirks."""
     url = url.strip()
-    # youtu.be/<id>?si=xxx  -> youtu.be/<id>
     m = re.match(r"^(https?://youtu\.be/[\w-]+)", url)
-    if m:
-        return m.group(1)
-    # youtube.com/watch?v=<id>&...  -> youtube.com/watch?v=<id>
+    if m: return m.group(1)
     m = re.match(r"^(https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+)", url)
-    if m:
-        return m.group(1)
-    # youtube.com/shorts/<id>?...  -> youtube.com/shorts/<id>
+    if m: return m.group(1)
     m = re.match(r"^(https?://(?:www\.)?youtube\.com/shorts/[\w-]+)", url)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     return url
+
+
+def _cookies_args() -> list:
+    """Return yt-dlp cookie arguments if a cookies file is available."""
+    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        return ["--cookies", COOKIES_FILE]
+    return []
 
 
 def get_video_info(url: str) -> Dict[str, Any]:
     clean_url = _clean_url(url)
-    cmd = [YTDLP_BIN, "--dump-json", "--no-playlist", "--no-warnings", clean_url]
+    cmd = [
+        YTDLP_BIN,
+        "--dump-json",
+        "--no-playlist",
+        "--no-warnings",
+        *_cookies_args(),
+        clean_url
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, **SUBPROCESS_FLAGS)
     if result.returncode != 0:
         raise ValueError(_friendly_yt_error(result.stderr or result.stdout))
@@ -68,7 +81,7 @@ def get_video_info(url: str) -> Dict[str, Any]:
 
 
 def _friendly_yt_error(raw_output: str) -> str:
-    """Translate common yt-dlp error patterns into a clear, specific message."""
+    """Translate common yt-dlp error patterns into clear, specific messages."""
     err = (raw_output or "").lower()
 
     if "private" in err:
@@ -77,33 +90,28 @@ def _friendly_yt_error(raw_output: str) -> str:
         return "This video is age-restricted and cannot be downloaded without sign-in."
     if "unavailable" in err or "not available" in err:
         return "This video is unavailable (may be deleted, region-blocked, or removed)."
-    if "sign in to confirm" in err or "not a bot" in err:
-        return "YouTube is requiring sign-in verification for this video (bot check). Try a different video, or update yt-dlp: pip install -U yt-dlp"
+    if "sign in to confirm" in err or "not a bot" in err or "bot" in err:
+        return (
+            "YouTube is blocking this server's IP (bot check). "
+            "Fix: Upload your cookies.txt file to backend/cookies/cookies.txt "
+            "and set YOUTUBE_COOKIES_FILE=/app/cookies/cookies.txt in Render environment variables."
+        )
     if "unable to extract" in err or "failed to extract" in err:
         return "YouTube changed something yt-dlp doesn't recognize yet. Run: pip install -U yt-dlp"
     if "certificate" in err or "ssl" in err:
-        return "SSL/certificate error reaching YouTube. Check your network/firewall/antivirus SSL inspection settings."
+        return "SSL/certificate error reaching YouTube."
     if "http error 429" in err or "too many requests" in err:
-        return "YouTube is rate-limiting this connection. Wait a few minutes and try again."
+        return "YouTube is rate-limiting this server. Wait a few minutes and try again."
     if "no video formats found" in err or "requested format is not available" in err:
-        return "No downloadable format found for this video with the current settings."
+        return "No downloadable format found for this video."
     if "ffmpeg" in err and ("not found" in err or "is not installed" in err):
         return "yt-dlp could not find FFmpeg. Check FFMPEG_PATH in backend/.env."
-    if "could not find a version that satisfies" in err or "command not found" in err or "is not recognized" in err:
-        return "yt-dlp executable not found. Run: pip install yt-dlp"
 
-    # Fall back to raw output (truncated) so nothing is ever silently hidden
     cleaned = raw_output.strip().replace("\n", " ")[:400] if raw_output else "Unknown error"
     return f"yt-dlp error: {cleaned}"
 
 
 def _build_format_selector() -> str:
-    """
-    Build the yt-dlp -f selector, capped to MAX_DOWNLOAD_HEIGHT (default
-    1080p) unless explicitly disabled via .env (MAX_DOWNLOAD_HEIGHT=0).
-    Falls back broadly so something always downloads even if mp4-specific
-    or height-capped streams aren't available for a given video.
-    """
     if MAX_DOWNLOAD_HEIGHT and MAX_DOWNLOAD_HEIGHT > 0:
         h = MAX_DOWNLOAD_HEIGHT
         return (
@@ -113,8 +121,7 @@ def _build_format_selector() -> str:
             f"bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo+bestaudio/best"
         )
-    # No cap — original "grab the absolute best" behavior
-    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best/bestvideo*+bestaudio/best"
+    return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 
 
 def download_video(
@@ -129,11 +136,14 @@ def download_video(
     clean_url = _clean_url(url)
     output_template = os.path.join(abs_dir, f"{video_id}.%(ext)s")
     final_mp4 = os.path.join(abs_dir, f"{video_id}.mp4")
-
-    # Tell yt-dlp exactly where ffmpeg.exe lives (critical on Windows)
     ffmpeg_dir = os.path.dirname(os.path.abspath(FFMPEG_BIN))
-
     format_selector = _build_format_selector()
+
+    cookies = _cookies_args()
+    if cookies:
+        print(f"[youtube] Using cookies file: {COOKIES_FILE}")
+    else:
+        print("[youtube] WARNING: No cookies file found. YouTube may block this download.")
 
     cmd = [
         YTDLP_BIN,
@@ -145,7 +155,8 @@ def download_video(
         "-o", output_template,
         "--newline",
         "--progress",
-        "--no-check-certificate",   # tolerate SSL-inspecting proxies/antivirus
+        "--no-check-certificate",
+        *cookies,          # --cookies cookies.txt if available
         clean_url,
     ]
 
@@ -161,7 +172,7 @@ def download_video(
     )
 
     tracked_file = None
-    full_output_lines = []   # capture EVERYTHING so failures are never silent
+    full_output_lines = []
 
     for line in process.stdout:
         line = line.strip()
@@ -190,11 +201,9 @@ def download_video(
             progress_callback(100, "Processing...")
 
     process.wait()
-
     full_output = "\n".join(full_output_lines)
 
     if process.returncode != 0:
-        # Surface the REAL error instead of a generic message
         raise RuntimeError(_friendly_yt_error(full_output))
 
     for candidate in [tracked_file, final_mp4]:
@@ -203,14 +212,12 @@ def download_video(
 
     for fname in sorted(os.listdir(abs_dir)):
         if fname.startswith(video_id):
-            full = os.path.join(abs_dir, fname)
-            if os.path.isfile(full):
-                return full
+            full_path = os.path.join(abs_dir, fname)
+            if os.path.isfile(full_path):
+                return full_path
 
-    # Even on returncode==0, if no file appeared, show the tail of yt-dlp's
-    # own output — this is the actual information needed to debug it
-    tail = "\n".join(full_output_lines[-15:]) if full_output_lines else "(no output captured)"
+    tail = "\n".join(full_output_lines[-15:]) if full_output_lines else "(no output)"
     raise RuntimeError(
-        f"yt-dlp reported success but no output file was found in {abs_dir}.\n"
+        f"yt-dlp reported success but no output file found in {abs_dir}.\n"
         f"Last yt-dlp output:\n{tail}"
     )
