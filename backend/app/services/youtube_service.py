@@ -8,19 +8,44 @@ from app.services.config import YTDLP_BIN, FFMPEG_BIN, SUBPROCESS_FLAGS
 
 MAX_DOWNLOAD_HEIGHT = int(os.getenv("MAX_DOWNLOAD_HEIGHT", "720") or "720")
 
-# Cookies file path — fixes YouTube bot-check on cloud servers
-COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "")
-if not COOKIES_FILE:
-    _candidates = [
+# ── Cookies file resolution ────────────────────────────────────────────────────
+# Checks multiple locations in priority order so it works on:
+#   - Render (Secret Files go to /etc/secrets/)
+#   - Local dev (backend/cookies/cookies.txt)
+#   - Docker (/app/cookies/cookies.txt)
+#   - Any custom path via YOUTUBE_COOKIES_FILE env var
+
+def _resolve_cookies_file() -> str:
+    # 1. Explicit env var (highest priority)
+    from_env = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+    if from_env and os.path.isfile(from_env):
+        print(f"[youtube] Using cookies from env var: {from_env}")
+        return from_env
+    if from_env:
+        print(f"[youtube] WARNING: YOUTUBE_COOKIES_FILE set to '{from_env}' but file not found there")
+
+    # 2. Render Secret Files location (Render always puts secrets here)
+    render_path = "/etc/secrets/cookies.txt"
+    if os.path.isfile(render_path):
+        print(f"[youtube] Found cookies at Render secret path: {render_path}")
+        return render_path
+
+    # 3. Local dev / Docker locations
+    candidates = [
         os.path.join(os.path.dirname(__file__), "..", "..", "cookies", "cookies.txt"),
         os.path.join(os.getcwd(), "cookies", "cookies.txt"),
         "/app/cookies/cookies.txt",
     ]
-    for _c in _candidates:
-        if os.path.isfile(_c):
-            COOKIES_FILE = os.path.abspath(_c)
-            print(f"[youtube] Auto-detected cookies file: {COOKIES_FILE}")
-            break
+    for c in candidates:
+        abs_c = os.path.abspath(c)
+        if os.path.isfile(abs_c):
+            print(f"[youtube] Found cookies at: {abs_c}")
+            return abs_c
+
+    print("[youtube] WARNING: No cookies.txt found in any location. YouTube may block downloads.")
+    return ""
+
+COOKIES_FILE = _resolve_cookies_file()
 
 
 def validate_youtube_url(url: str) -> bool:
@@ -44,8 +69,11 @@ def _clean_url(url: str) -> str:
 
 
 def _cookies_args() -> list:
-    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
-        return ["--cookies", COOKIES_FILE]
+    """Return --cookies arg if a valid cookies file is found."""
+    # Re-resolve every call in case file appeared after startup
+    cookies = COOKIES_FILE or _resolve_cookies_file()
+    if cookies and os.path.isfile(cookies):
+        return ["--cookies", cookies]
     return []
 
 
@@ -59,7 +87,6 @@ def get_video_info(url: str) -> Dict[str, Any]:
         *_cookies_args(),
         clean_url
     ]
-    # Increased from 30s to 120s for slow cloud servers
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, **SUBPROCESS_FLAGS)
     if result.returncode != 0:
         raise ValueError(_friendly_yt_error(result.stderr or result.stdout))
@@ -85,33 +112,25 @@ def _friendly_yt_error(raw_output: str) -> str:
     if "sign in to confirm" in err or "not a bot" in err or "bot" in err:
         return (
             "YouTube is blocking this server's IP (bot check). "
-            "Upload cookies.txt to backend/cookies/ and set "
-            "YOUTUBE_COOKIES_FILE=/app/cookies/cookies.txt in Render env vars."
+            "Go to Render Dashboard → Environment → Secret Files → "
+            "add filename '/etc/secrets/cookies.txt' with your YouTube cookies content. "
+            "Then add env var YOUTUBE_COOKIES_FILE=/etc/secrets/cookies.txt"
         )
     if "unable to extract" in err or "failed to extract" in err:
-        return "yt-dlp needs updating. Run: pip install -U yt-dlp"
+        return "yt-dlp needs updating. Contact admin."
     if "certificate" in err or "ssl" in err:
-        return "SSL/certificate error reaching YouTube."
+        return "SSL error reaching YouTube."
     if "http error 429" in err or "too many requests" in err:
-        return "YouTube is rate-limiting this server. Wait a few minutes and try again."
+        return "YouTube rate-limiting this server. Wait a few minutes."
     if "no video formats found" in err or "requested format is not available" in err:
-        return "No downloadable format found."
-    if "ffmpeg" in err and ("not found" in err or "is not installed" in err):
-        return "FFmpeg not found. Check FFMPEG_PATH in backend/.env."
+        return "No downloadable format found for this video."
     if "no space left" in err or "disk" in err:
-        return "Server ran out of disk space. Render free tier has very limited storage."
+        return "Server ran out of disk space. Try again later."
     cleaned = raw_output.strip().replace("\n", " ")[:500] if raw_output else "Unknown error"
     return f"yt-dlp error: {cleaned}"
 
 
 def _build_format_selector() -> str:
-    """
-    On Render free tier:
-    - Disk is limited (~500MB usable)
-    - Download at 720p max to keep file sizes under ~200MB
-    - Prefer mp4 to avoid remuxing overhead
-    - Fall back broadly so something always downloads
-    """
     if MAX_DOWNLOAD_HEIGHT and MAX_DOWNLOAD_HEIGHT > 0:
         h = MAX_DOWNLOAD_HEIGHT
         return (
@@ -133,16 +152,15 @@ def download_video(
     abs_dir = os.path.abspath(output_dir)
     os.makedirs(abs_dir, exist_ok=True)
 
-    # Check available disk space before downloading (Render free = ~512MB)
+    # Check disk space
     try:
         import shutil
-        free_bytes = shutil.disk_usage(abs_dir).free
-        free_mb = free_bytes / (1024 * 1024)
-        print(f"[youtube] Available disk space: {free_mb:.0f} MB")
+        free_mb = shutil.disk_usage(abs_dir).free / (1024 * 1024)
+        print(f"[youtube] Available disk: {free_mb:.0f} MB")
         if free_mb < 150:
             raise RuntimeError(
-                f"Only {free_mb:.0f}MB disk space remaining on server. "
-                "Free tier storage is limited — try again later or upgrade your Render plan."
+                f"Only {free_mb:.0f}MB disk space left on server. "
+                "Render free tier has limited storage — try again later."
             )
     except RuntimeError:
         raise
@@ -157,9 +175,9 @@ def download_video(
     cookies = _cookies_args()
 
     if cookies:
-        print(f"[youtube] Using cookies: {COOKIES_FILE}")
+        print(f"[youtube] Using cookies: {cookies[1]}")
     else:
-        print("[youtube] WARNING: No cookies file — YouTube may block this download.")
+        print("[youtube] No cookies — YouTube may block this download")
 
     cmd = [
         YTDLP_BIN,
@@ -172,7 +190,6 @@ def download_video(
         "--newline",
         "--progress",
         "--no-check-certificate",
-        # Limit download speed reporting overhead on slow servers
         "--socket-timeout", "30",
         "--retries", "3",
         *cookies,
@@ -182,12 +199,8 @@ def download_video(
     popen_flags = {k: v for k, v in SUBPROCESS_FLAGS.items() if k != "creationflags"}
 
     process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        **popen_flags
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, **popen_flags
     )
 
     tracked_file = None
@@ -198,24 +211,20 @@ def download_video(
         if not line:
             continue
         full_output_lines.append(line)
-
         if "[download]" in line and "%" in line:
             m = re.search(r"(\d+\.?\d*)%", line)
             if m and progress_callback:
                 progress_callback(int(float(m.group(1))), f"Downloading... {m.group(1)}%")
-
         if "Destination:" in line:
             m = re.search(r"Destination:\s*(.+)", line)
             if m:
                 c = m.group(1).strip()
                 if c.lower().endswith(".mp4"):
                     tracked_file = c
-
         if "[Merger]" in line:
             m = re.search(r'Merging formats into "(.+?)"', line)
             if m:
                 tracked_file = m.group(1).strip()
-
         if "[download] 100%" in line and progress_callback:
             progress_callback(100, "Processing...")
 
@@ -231,12 +240,9 @@ def download_video(
 
     for fname in sorted(os.listdir(abs_dir)):
         if fname.startswith(video_id):
-            full_path = os.path.join(abs_dir, fname)
-            if os.path.isfile(full_path):
-                return full_path
+            fp = os.path.join(abs_dir, fname)
+            if os.path.isfile(fp):
+                return fp
 
     tail = "\n".join(full_output_lines[-15:]) if full_output_lines else "(no output)"
-    raise RuntimeError(
-        f"yt-dlp reported success but no output file found.\n"
-        f"Last output:\n{tail}"
-    )
+    raise RuntimeError(f"yt-dlp succeeded but no file found.\nLast output:\n{tail}")
